@@ -1,5 +1,5 @@
-import 'dotenv/config';
-import express from 'express';
+import "dotenv/config";
+import express, { text } from "express";
 import {
   ButtonStyleTypes,
   InteractionResponseFlags,
@@ -7,14 +7,14 @@ import {
   InteractionType,
   MessageComponentTypes,
   verifyKeyMiddleware,
-} from 'discord-interactions';
-import { getRandomEmoji, DiscordRequest } from './utils.js';
-import { getShuffledOptions, getResult } from './game.js';
+} from "discord-interactions";
+import { getRandomEmoji, DiscordRequest } from "./utils.js";
+import { getShuffledOptions, getResult } from "./game.js";
 
 // Create an express app
 const app = express();
 // Get port, or default to 3000
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 // To keep track of our active games
 const activeGames = {};
 
@@ -22,50 +22,74 @@ const activeGames = {};
  * Interactions endpoint URL where Discord will send HTTP requests
  * Parse request body and verifies incoming requests using discord-interactions package
  */
-app.post('/interactions', verifyKeyMiddleware(process.env.PUBLIC_KEY), async function (req, res) {
-  // Interaction id, type and data
-  const { id, type, data } = req.body;
+app.post(
+  "/interactions",
+  verifyKeyMiddleware(process.env.PUBLIC_KEY),
+  async function (req, res) {
+    // Interaction id, type and data
+    const { id, type, data } = req.body;
 
-  /**
-   * Handle verification requests
-   */
-  if (type === InteractionType.PING) {
-    return res.send({ type: InteractionResponseType.PONG });
-  }
-
-  /**
-   * Handle slash command requests
-   * See https://discord.com/developers/docs/interactions/application-commands#slash-commands
-   */
-  if (type === InteractionType.APPLICATION_COMMAND) {
-    const { name } = data;
-
-    // "test" command
-    if (name === 'test') {
-      // Send a message into the channel where command was triggered from
-      return res.send({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: {
-          flags: InteractionResponseFlags.IS_COMPONENTS_V2,
-          components: [
-            {
-              type: MessageComponentTypes.TEXT_DISPLAY,
-              // Fetches a random emoji to send from a helper function
-              content: `hello world ${getRandomEmoji()}`
-            }
-          ]
-        },
-      });
+    /**
+     * Handle verification requests
+     */
+    if (type === InteractionType.PING) {
+      return res.send({ type: InteractionResponseType.PONG });
     }
 
-    console.error(`unknown command: ${name}`);
-    return res.status(400).json({ error: 'unknown command' });
-  }
+    /**
+     * Handle slash command requests
+     * See https://discord.com/developers/docs/interactions/application-commands#slash-commands
+     */
+    if (type === InteractionType.APPLICATION_COMMAND) {
+      const { name } = data;
 
-  console.error('unknown interaction type', type);
-  return res.status(400).json({ error: 'unknown interaction type' });
-});
+      // "test" command
+      if (name === "test") {
+        // Send a message into the channel where command was triggered from
+        return res.send({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: {
+            flags: InteractionResponseFlags.IS_COMPONENTS_V2,
+            components: [
+              {
+                type: 9, // ComponentType.SECTION
+                components: [
+                  {
+                    type: 10, // ComponentType.TEXT_DISPLAY
+                    content: "# Real Game v7.3",
+                  },
+                  {
+                    type: 10, // ComponentType.TEXT_DISPLAY
+                    content:
+                      "Hope you're excited, the update is finally here! Here are some of the changes:\n- Fixed a bug where certain treasure chests wouldn't open properly\n- Improved server stability during peak hours\n- Added a new type of gravity that will randomly apply when the moon is visible in-game\n- Every third thursday the furniture will scream your darkest secrets to nearby npcs",
+                  },
+                  {
+                    type: 10, // ComponentType.TEXT_DISPLAY
+                    content:
+                      "-# That last one wasn't real, but don't use voice chat near furniture just in case...",
+                  },
+                ],
+                accessory: {
+                  type: 11, // ComponentType.THUMBNAIL
+                  media: {
+                    url: "https://themindcollection.com/wp-content/uploads/2022/12/Ship-of-Theseus_830.jpg",
+                  },
+                },
+              },
+            ],
+          },
+        });
+      }
+
+      console.error(`unknown command: ${name}`);
+      return res.status(400).json({ error: "unknown command" });
+    }
+
+    console.error("unknown interaction type", type);
+    return res.status(400).json({ error: "unknown interaction type" });
+  }
+);
 
 app.listen(PORT, () => {
-  console.log('Listening on port', PORT);
+  console.log("Listening on port", PORT);
 });
