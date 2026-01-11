@@ -10,6 +10,13 @@ import {
 } from "discord-interactions";
 import { getRandomEmoji, DiscordRequest } from "./utils.js";
 import { getShuffledOptions, getResult } from "./game.js";
+import OpenAI from "openai";
+const client = new OpenAI();
+import {
+  connectToGateway,
+  joinVoiceChannel,
+  leaveVoiceChannel,
+} from "./gateway.js";
 
 // Create an express app
 const app = express();
@@ -27,7 +34,7 @@ app.post(
   verifyKeyMiddleware(process.env.PUBLIC_KEY),
   async function (req, res) {
     // Interaction id, type and data
-    const { id, type, data } = req.body;
+    const { id, type, data, guild_ID } = req.body;
 
     /**
      * Handle verification requests
@@ -52,29 +59,36 @@ app.post(
             flags: InteractionResponseFlags.IS_COMPONENTS_V2,
             components: [
               {
-                type: 9, // ComponentType.SECTION
+                type: 17, // ComponentType.CONTAINER
                 components: [
                   {
                     type: 10, // ComponentType.TEXT_DISPLAY
                     content: "# Real Game v7.3",
                   },
                   {
-                    type: 10, // ComponentType.TEXT_DISPLAY
-                    content:
-                      "Hope you're excited, the update is finally here! Here are some of the changes:\n- Fixed a bug where certain treasure chests wouldn't open properly\n- Improved server stability during peak hours\n- Added a new type of gravity that will randomly apply when the moon is visible in-game\n- Every third thursday the furniture will scream your darkest secrets to nearby npcs",
-                  },
-                  {
-                    type: 10, // ComponentType.TEXT_DISPLAY
-                    content:
-                      "-# That last one wasn't real, but don't use voice chat near furniture just in case...",
+                    type: 1, // ComponentType.ACTION_ROW
+                    components: [
+                      {
+                        type: 2, // ComponentType.BUTTON
+                        style: 1, // ButtonStyle.PRIMARY
+                        label: "Submit Feedback",
+                        custom_id: "open_feedback_modal",
+                      },
+                      {
+                        type: 2, // ComponentType.BUTTON
+                        style: 2, // ButtonStyle.PRIMARY
+                        label: "Join Voice",
+                        custom_id: "test_voice",
+                      },
+                      {
+                        type: 2, // ComponentType.BUTTON
+                        style: 2, // ButtonStyle.PRIMARY
+                        label: "Leave Voice",
+                        custom_id: "leave_voice",
+                      },
+                    ],
                   },
                 ],
-                accessory: {
-                  type: 11, // ComponentType.THUMBNAIL
-                  media: {
-                    url: "https://themindcollection.com/wp-content/uploads/2022/12/Ship-of-Theseus_830.jpg",
-                  },
-                },
               },
             ],
           },
@@ -85,10 +99,128 @@ app.post(
       return res.status(400).json({ error: "unknown command" });
     }
 
+    if (type === InteractionType.MESSAGE_COMPONENT) {
+      const { custom_id } = data;
+      console.log(data);
+
+      if (custom_id === "test_voice") {
+        const { user } = req.body.member;
+        const { guild_id } = req.body;
+
+        const response = await fetch(
+          `https://discord.com/api/v10/guilds/${guild_id}/voice-states/${user.id}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+          }
+        );
+
+        if (response.ok) {
+          const voiceState = await response.json();
+          console.log("User voice state:", voiceState);
+          console.log("User is in channel:", voiceState.channel_id);
+          joinVoiceChannel(guild_id, voiceState.channel_id);
+        } else if (response.status === 404) {
+          console.log("User is not in a voice channel");
+        } else {
+          console.log("Error:", response.status, await response.text());
+        }
+      }
+
+      if (custom_id === "leave_voice") {
+        const { guild_id } = req.body;
+
+        leaveVoiceChannel(guild_id);
+      }
+
+      // "test" command
+      if (custom_id === "open_feedback_modal") {
+        // Send a message into the channel where command was triggered from
+        // When you receive an interaction with custom_id === "open_feedback_modal"
+        return res.send({
+          type: InteractionResponseType.MODAL,
+          data: {
+            custom_id: "feedback_modal_submit",
+            title: "Real Game v7.3",
+            components: [
+              {
+                type: 1, // ComponentType.ACTION_ROW
+                components: [
+                  {
+                    type: 4, // ComponentType.TEXT_INPUT
+                    style: 1, // 1 = short, 2 = paragraph
+                    custom_id: "feedback_text",
+                    label: "Your feedback",
+                    placeholder: "Type something here...",
+                    required: true,
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+
+      console.error(`unknown command: ${custom_id}`);
+      return res.status(400).json({ error: "unknown command" });
+    }
+
+    if (type === InteractionType.MODAL_SUBMIT) {
+      const { custom_id, components } = data;
+      const { value } = components[0].components[0];
+      console.log(components[0].components[0].value);
+
+      const stream = await client.responses.create({
+        model: "gpt-5",
+        input: [
+          {
+            role: "user",
+            content: "Say 'double bubble bath' ten times fast.",
+          },
+        ],
+        stream: true,
+      });
+
+      for await (const event of stream) {
+        if (event.type == "response.output_text.delta") {
+          console.log(event.delta);
+        }
+      }
+
+      // "test" command
+      if (custom_id == "feedback_modal_submit") {
+        return res.send({
+          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: {
+            flags: InteractionResponseFlags.IS_COMPONENTS_V2,
+            components: [
+              {
+                type: 17, // ComponentType.CONTAINER
+                components: [
+                  {
+                    type: 10, // ComponentType.TEXT_DISPLAY
+                    content: "YO YOY O",
+                  },
+                ],
+              },
+            ],
+          },
+        });
+      }
+
+      console.error(`unknown command: ${custom_id}`);
+      return res.status(400).json({ error: "unknown command" });
+    }
+
     console.error("unknown interaction type", type);
     return res.status(400).json({ error: "unknown interaction type" });
   }
 );
+
+await connectToGateway();
 
 app.listen(PORT, () => {
   console.log("Listening on port", PORT);
