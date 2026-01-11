@@ -1,6 +1,8 @@
 import WebSocket from "ws";
 import dgram from "dgram";
 import { randomBytes } from "crypto";
+import fs from "fs";
+import { spawn } from "child_process";
 import pkg from "@discordjs/opus";
 const { OpusEncoder } = pkg;
 import prism from "prism-media";
@@ -31,6 +33,11 @@ let audioInterval = null;
 
 // Opus encoder: 48kHz, stereo
 const opusEncoder = new OpusEncoder(48000, 2);
+
+// Recording state
+let isRecording = false;
+let recordingStreams = new Map(); // SSRC -> { decoder, pcmChunks, lastSequence }
+let recordingStartTime = null;
 
 // Initialize sodium
 let sodiumReady = false;
@@ -245,7 +252,9 @@ function connectToVoiceGateway() {
         // Store the encryption key
         secretKey = Buffer.from(d.secret_key);
         console.log("Encryption key received, ready to send audio!");
-        playAudio("./heyguys.mp3");
+        console.log("Secret key SET TO:", secretKey.toString("hex"));
+        playAudio("./song.mp3");
+        startRecording();
         break;
 
       case 6: // Heartbeat ACK
@@ -254,6 +263,8 @@ function connectToVoiceGateway() {
   });
 
   voiceWs.on("close", (code, reason) => {
+    const filename = stopRecording();
+    console.log("Saved to: ", filename);
     console.log(
       "Voice gateway disconnected! Code:",
       code,
@@ -347,6 +358,9 @@ function performIpDiscovery(discordIp, discordPort, ssrc) {
 
       // Now we can select the protocol
       selectProtocol();
+    } else {
+      // This is voice data - handle recording if enabled
+      handleIncomingVoicePacket(msg);
     }
   });
 
@@ -429,6 +443,65 @@ function encryptAudio(header, audioData) {
 // Queue for audio frames (paced at 20ms intervals)
 let audioFrameQueue = [];
 let isPlaying = false;
+let playbackStartTime = null;
+let framesSent = 0;
+
+// Pre-buffer configuration: buffer ~300ms before starting playback
+const PRE_BUFFER_FRAMES = 15;
+
+// Pre-encode a silence frame for queue underrun
+const silenceFrame = opusEncoder.encode(Buffer.alloc(960 * 2 * 2));
+
+// Send a single audio frame over UDP
+function sendAudioFrame(opusFrame) {
+  const rtpHeader = createRtpHeader(
+    sequenceNumber,
+    timestamp,
+    voiceUdpInfo.ssrc
+  );
+
+  const packet = encryptAudio(rtpHeader, opusFrame);
+  udpSocket.send(packet, voiceUdpInfo.discordPort, voiceUdpInfo.discordIp);
+
+  sequenceNumber = (sequenceNumber + 1) & 0xffff;
+  timestamp = (timestamp + 960) >>> 0; // 960 samples at 48kHz = 20ms
+}
+
+// Drift-compensated audio frame sender using high-resolution timer
+function startSendingFrames() {
+  playbackStartTime = process.hrtime.bigint();
+  framesSent = 0;
+
+  function sendNext() {
+    if (!isPlaying) return;
+
+    const elapsed = Number(process.hrtime.bigint() - playbackStartTime) / 1_000_000; // ms
+    const expectedFrames = Math.floor(elapsed / 20);
+
+    // Send all frames that should have been sent by now
+    while (framesSent < expectedFrames) {
+      if (audioFrameQueue.length > 0) {
+        sendAudioFrame(audioFrameQueue.shift());
+      } else if (currentAudioStream) {
+        // Queue underrun but stream still active - send silence
+        sendAudioFrame(silenceFrame);
+      } else {
+        // Stream ended and queue empty - stop playback
+        console.log("Audio playback finished");
+        stopAudio();
+        return;
+      }
+      framesSent++;
+    }
+
+    // Schedule next check with drift compensation
+    const nextFrameTime = (framesSent + 1) * 20;
+    const delay = Math.max(1, nextFrameTime - elapsed);
+    audioInterval = setTimeout(sendNext, delay);
+  }
+
+  sendNext();
+}
 
 export function playAudio(filePath) {
   if (!secretKey) {
@@ -479,6 +552,7 @@ export function playAudio(filePath) {
   // Buffer for collecting PCM data
   const frameSize = 960 * 2 * 2; // 960 samples * 2 channels * 2 bytes per sample = 20ms of audio
   let pcmBuffer = Buffer.alloc(0);
+  let playbackStarted = false;
 
   ffmpeg.on("data", (chunk) => {
     pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
@@ -492,49 +566,28 @@ export function playAudio(filePath) {
       const opusFrame = opusEncoder.encode(frame);
       audioFrameQueue.push(opusFrame);
     }
+
+    // Start playback only after buffering enough frames (prevents choppy start)
+    if (!playbackStarted && audioFrameQueue.length >= PRE_BUFFER_FRAMES) {
+      playbackStarted = true;
+      console.log(`Pre-buffered ${PRE_BUFFER_FRAMES} frames, starting playback...`);
+      startSendingFrames();
+    }
   });
 
   ffmpeg.on("end", () => {
     console.log("Audio file read complete, finishing playback...");
+    // If stream ends before we started (very short file), start now
+    if (!playbackStarted && audioFrameQueue.length > 0) {
+      playbackStarted = true;
+      startSendingFrames();
+    }
   });
 
   ffmpeg.on("error", (err) => {
     console.error("FFmpeg error:", err);
     stopAudio();
   });
-
-  // Get the Discord voice server address
-  const discordVoiceHost = voiceServerData.endpoint.split(":")[0];
-  const discordVoicePort =
-    parseInt(voiceServerData.endpoint.split(":")[1]) || 443;
-
-  // Start sending frames at 20ms intervals
-  audioInterval = setInterval(() => {
-    if (audioFrameQueue.length > 0) {
-      const opusFrame = audioFrameQueue.shift();
-
-      // Create RTP header
-      const rtpHeader = createRtpHeader(
-        sequenceNumber,
-        timestamp,
-        voiceUdpInfo.ssrc
-      );
-
-      // Encrypt and create packet
-      const packet = encryptAudio(rtpHeader, opusFrame);
-
-      // Send via UDP to the voice server's UDP port (from Ready event)
-      udpSocket.send(packet, voiceUdpInfo.discordPort, voiceUdpInfo.discordIp);
-
-      // Increment sequence and timestamp
-      sequenceNumber = (sequenceNumber + 1) & 0xffff;
-      timestamp = (timestamp + 960) >>> 0; // 960 samples at 48kHz = 20ms
-    } else if (!currentAudioStream) {
-      // Stream ended and queue is empty
-      console.log("Audio playback finished");
-      stopAudio();
-    }
-  }, 20); // 20ms per frame
 }
 
 export function stopAudio() {
@@ -543,12 +596,205 @@ export function stopAudio() {
     currentAudioStream = null;
   }
   if (audioInterval) {
-    clearInterval(audioInterval);
+    clearTimeout(audioInterval);
     audioInterval = null;
   }
   audioFrameQueue = [];
   isPlaying = false;
+  playbackStartTime = null;
+  framesSent = 0;
   if (voiceWs && voiceWs.readyState === WebSocket.OPEN) {
     setSpeaking(false);
   }
+}
+
+// ============ Voice Recording Functions ============
+
+function handleIncomingVoicePacket(packet) {
+  if (!isRecording || !secretKey || !sodiumReady) {
+    return;
+  }
+
+  // Minimum RTP packet size: 12 byte header + some audio + 4 byte nonce
+  if (packet.length < 20) {
+    return;
+  }
+
+  // Parse RTP header
+  const version = (packet[0] >> 6) & 0x03;
+  if (version !== 2) {
+    return; // Not a valid RTP packet
+  }
+
+  // Check payload type - must be 120 for Opus audio
+  const payloadType = packet[1] & 0x7f;
+  if (payloadType !== 120) {
+    return; // Not Opus audio (might be RTCP)
+  }
+
+  const hasExtension = (packet[0] & 0x10) !== 0;
+  const sequence = packet.readUInt16BE(2);
+  const rtpTimestamp = packet.readUInt32BE(4);
+  const ssrc = packet.readUInt32BE(8);
+
+  // For testing: try to decrypt our own packets too
+  const isOwnPacket = ssrc === voiceUdpInfo.ssrc;
+  if (isOwnPacket) {
+    console.log("Attempting to decrypt OWN packet for testing...");
+  }
+
+  // Packet structure: [RTP header + extension (AAD)] [encrypted data] [4-byte nonce]
+  // Calculate full header length including extension
+  let headerLength = 12;
+  if (hasExtension) {
+    // Extension: 4-byte header + N*4 bytes of data
+    const extLengthWords = packet.readUInt16BE(14); // Length in 32-bit words
+    headerLength = 12 + 4 + extLengthWords * 4;
+  }
+
+  const rtpHeader = packet.slice(0, headerLength); // Full header as AAD
+  const encryptedPayload = packet.slice(headerLength, packet.length - 4);
+  const nonceBytes = packet.slice(packet.length - 4);
+
+  // Debug: show first packet details
+  if (!recordingStreams.has(ssrc)) {
+    console.log("=== FIRST PACKET FROM SSRC", ssrc, "===");
+    console.log("Full packet hex:", packet.toString("hex"));
+    console.log("Packet length:", packet.length);
+    console.log("Header length (incl ext):", headerLength);
+    console.log("RTP header:", rtpHeader.toString("hex"));
+    console.log("Encrypted payload length:", encryptedPayload.length);
+    console.log("Nonce bytes:", nonceBytes.toString("hex"));
+  }
+
+  // Reconstruct the 24-byte nonce
+  // The nonce bytes appear to be little-endian, but we need big-endian like we use for sending
+  const nonce = Buffer.alloc(24);
+  const nonceValue = nonceBytes.readUInt32LE(0); // Read as little-endian
+  nonce.writeUInt32BE(nonceValue, 0); // Write as big-endian (matching our encrypt)
+
+  try {
+    // Decrypt using XChaCha20-Poly1305
+    const decrypted = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+      null, // nsec (unused)
+      encryptedPayload,
+      rtpHeader, // Additional authenticated data (12-byte base header only)
+      nonce,
+      secretKey
+    );
+
+    if (!decrypted) {
+      return;
+    }
+
+    // Decrypted data is the Opus audio (extension was in AAD, not encrypted)
+    const opusData = Buffer.from(decrypted);
+
+    // Get or create decoder for this SSRC
+    if (!recordingStreams.has(ssrc)) {
+      recordingStreams.set(ssrc, {
+        decoder: new OpusEncoder(48000, 2),
+        pcmChunks: [],
+        lastSequence: sequence,
+        lastTimestamp: rtpTimestamp,
+      });
+      console.log(`Recording new speaker: SSRC ${ssrc}`);
+    }
+
+    const stream = recordingStreams.get(ssrc);
+
+    // Decode Opus to PCM
+    const pcm = stream.decoder.decode(opusData);
+    stream.pcmChunks.push(pcm);
+    stream.lastSequence = sequence;
+    stream.lastTimestamp = rtpTimestamp;
+  } catch (err) {
+    console.error("Voice packet processing failed:", err.message);
+  }
+}
+
+export function startRecording() {
+  if (!secretKey) {
+    console.error("Cannot start recording: voice session not established");
+    return false;
+  }
+
+  if (!sodiumReady) {
+    console.error("Cannot start recording: encryption not ready");
+    return false;
+  }
+
+  console.log("Starting voice recording...");
+  isRecording = true;
+  recordingStreams.clear();
+  recordingStartTime = Date.now();
+  return true;
+}
+
+export function stopRecording() {
+  if (!isRecording) {
+    console.log("Not currently recording");
+    return null;
+  }
+
+  console.log("Stopping voice recording...");
+  isRecording = false;
+
+  // Collect all PCM data from all streams
+  const allPcmChunks = [];
+  for (const [ssrc, stream] of recordingStreams) {
+    console.log(`SSRC ${ssrc}: ${stream.pcmChunks.length} chunks`);
+    allPcmChunks.push(...stream.pcmChunks);
+  }
+
+  if (allPcmChunks.length === 0) {
+    console.log("No audio data recorded");
+    recordingStreams.clear();
+    return null;
+  }
+
+  // Combine all PCM data
+  const combinedPcm = Buffer.concat(allPcmChunks);
+  console.log(`Total PCM data: ${combinedPcm.length} bytes`);
+
+  // Generate output filename
+  const filename = `recording_${recordingStartTime}.mp3`;
+
+  // Use ffmpeg to convert PCM to MP3
+  const ffmpeg = spawn("ffmpeg", [
+    "-f",
+    "s16le", // Input format: signed 16-bit little-endian
+    "-ar",
+    "48000", // Sample rate: 48kHz
+    "-ac",
+    "2", // Channels: stereo
+    "-i",
+    "pipe:0", // Input from stdin
+    "-b:a",
+    "128k", // Bitrate: 128kbps
+    "-y", // Overwrite output file
+    filename,
+  ]);
+
+  ffmpeg.on("error", (err) => {
+    console.error("FFmpeg error:", err);
+  });
+
+  ffmpeg.on("close", (code) => {
+    if (code === 0) {
+      console.log(`Recording saved to ${filename}`);
+    } else {
+      console.error(`FFmpeg exited with code ${code}`);
+    }
+  });
+
+  // Write PCM data to ffmpeg stdin
+  ffmpeg.stdin.write(combinedPcm);
+  ffmpeg.stdin.end();
+
+  // Clear recording state
+  recordingStreams.clear();
+  recordingStartTime = null;
+
+  return filename;
 }

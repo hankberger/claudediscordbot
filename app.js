@@ -122,6 +122,8 @@ app.post(
           const voiceState = await response.json();
           console.log("User voice state:", voiceState);
           console.log("User is in channel:", voiceState.channel_id);
+          //TODO: Probably move these next 2 lines to their own instance
+          await connectToGateway();
           joinVoiceChannel(guild_id, voiceState.channel_id);
         } else if (response.status === 404) {
           console.log("User is not in a voice channel");
@@ -219,8 +221,6 @@ app.post(
     return res.status(400).json({ error: "unknown interaction type" });
   }
 );
-
-await connectToGateway();
 
 app.listen(PORT, () => {
   console.log("Listening on port", PORT);
