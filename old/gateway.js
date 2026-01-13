@@ -643,7 +643,9 @@ function handleIncomingVoicePacket(packet) {
     console.log("Attempting to decrypt OWN packet for testing...");
   }
 
-  // Packet structure: [RTP header + extension (AAD)] [encrypted data] [4-byte nonce]
+  // Packet structure: [RTP header + extension] [encrypted data] [4-byte nonce]
+  // For aead_xchacha20_poly1305_rtpsize: AAD is the FULL unencrypted header (including extension)
+
   // Calculate full header length including extension
   let headerLength = 12;
   if (hasExtension) {
@@ -652,7 +654,7 @@ function handleIncomingVoicePacket(packet) {
     headerLength = 12 + 4 + extLengthWords * 4;
   }
 
-  const rtpHeader = packet.slice(0, headerLength); // Full header as AAD
+  const fullHeader = packet.slice(0, headerLength); // Full header as AAD
   const encryptedPayload = packet.slice(headerLength, packet.length - 4);
   const nonceBytes = packet.slice(packet.length - 4);
 
@@ -661,24 +663,24 @@ function handleIncomingVoicePacket(packet) {
     console.log("=== FIRST PACKET FROM SSRC", ssrc, "===");
     console.log("Full packet hex:", packet.toString("hex"));
     console.log("Packet length:", packet.length);
-    console.log("Header length (incl ext):", headerLength);
-    console.log("RTP header:", rtpHeader.toString("hex"));
+    console.log("Has extension:", hasExtension);
+    console.log("Header length:", headerLength);
+    console.log("Full header (AAD):", fullHeader.toString("hex"));
     console.log("Encrypted payload length:", encryptedPayload.length);
     console.log("Nonce bytes:", nonceBytes.toString("hex"));
+    console.log("Secret key length:", secretKey.length);
   }
 
-  // Reconstruct the 24-byte nonce
-  // The nonce bytes appear to be little-endian, but we need big-endian like we use for sending
+  // Reconstruct the 24-byte nonce - try placing 4 bytes at the END (bytes 20-23)
   const nonce = Buffer.alloc(24);
-  const nonceValue = nonceBytes.readUInt32LE(0); // Read as little-endian
-  nonce.writeUInt32BE(nonceValue, 0); // Write as big-endian (matching our encrypt)
+  nonceBytes.copy(nonce, 20, 0, 4); // Place at end of 24-byte nonce
 
   try {
-    // Decrypt using XChaCha20-Poly1305
+    // Decrypt using XChaCha20-Poly1305 with full header as AAD
     const decrypted = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
       null, // nsec (unused)
       encryptedPayload,
-      rtpHeader, // Additional authenticated data (12-byte base header only)
+      fullHeader, // AAD: full RTP header including extension
       nonce,
       secretKey
     );

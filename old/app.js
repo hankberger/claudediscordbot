@@ -8,8 +8,6 @@ import {
   MessageComponentTypes,
   verifyKeyMiddleware,
 } from "discord-interactions";
-import { getRandomEmoji, DiscordRequest } from "./utils.js";
-import { getShuffledOptions, getResult } from "./game.js";
 import OpenAI from "openai";
 const client = new OpenAI();
 import {
